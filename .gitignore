@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.pytest_cache/
+test_morning.py
+test_raw.py
+update_env.js
