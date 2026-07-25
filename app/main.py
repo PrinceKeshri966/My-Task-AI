@@ -26,12 +26,15 @@ Reschedule rule (per Prince's spec), now a proper two-phase flow:
     - "move <task> to <date>" -> commit that task to the given date
       instead of its proposal; everything else still commits normally.
 """
+import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
 
 from . import config, sheets, whatsapp, reply_parser, calendar_sync
 
 app = FastAPI(title="Prep Tracker WhatsApp Bot")
+logger = logging.getLogger("prep-bot")
 
 
 def _today_str() -> str:
@@ -44,18 +47,26 @@ def _day_name(date_str: str) -> str:
 
 @app.post("/trigger/morning")
 def trigger_morning():
-    date_str = _today_str()
-    tasks = sheets.get_tasks_for_date(date_str)
-    whatsapp.send_message(whatsapp.format_morning_brief(tasks))
-    return {"sent": True, "task_count": len(tasks)}
+    try:
+        date_str = _today_str()
+        tasks = sheets.get_tasks_for_date(date_str)
+        whatsapp.send_message(whatsapp.format_morning_brief(tasks))
+        return {"sent": True, "task_count": len(tasks)}
+    except Exception:
+        logger.exception("trigger_morning failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": "morning trigger failed, check Render logs"})
 
 
 @app.post("/trigger/checkin")
 def trigger_checkin():
-    date_str = _today_str()
-    tasks = sheets.get_tasks_for_date(date_str)
-    whatsapp.send_message(whatsapp.format_checkin(tasks))
-    return {"sent": True, "task_count": len(tasks)}
+    try:
+        date_str = _today_str()
+        tasks = sheets.get_tasks_for_date(date_str)
+        whatsapp.send_message(whatsapp.format_checkin(tasks))
+        return {"sent": True, "task_count": len(tasks)}
+    except Exception:
+        logger.exception("trigger_checkin failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": "checkin trigger failed, check Render logs"})
 
 
 def _commit_proposal(row: dict):
@@ -70,82 +81,87 @@ async def whatsapp_webhook(request: Request, x_webhook_secret: str = Header(defa
     if config.WEBHOOK_SHARED_SECRET and x_webhook_secret != config.WEBHOOK_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="bad secret")
 
-    form = await request.form()
-    reply_text = form.get("Body", "")
-    today = _today_str()
+    try:
+        form = await request.form()
+        reply_text = form.get("Body", "")
+        today = _today_str()
 
-    pending = sheets.get_pending_confirmations()
+        pending = sheets.get_pending_confirmations()
 
-    # ---------- PHASE 2: confirming/overriding a previous proposal ----------
-    if pending:
-        parsed = reply_parser.parse_override_reply(reply_text, today)
-        overridden_names = {o["task"].lower() for o in parsed["overrides"]}
+        # ---------- PHASE 2: confirming/overriding a previous proposal ----------
+        if pending:
+            parsed = reply_parser.parse_override_reply(reply_text, today)
+            overridden_names = {o["task"].lower() for o in parsed["overrides"]}
 
-        committed_lines = []
+            committed_lines = []
 
-        # Apply explicit overrides first
-        for override in parsed["overrides"]:
-            match = sheets.find_task_by_name(override["task"])
-            if not match:
-                committed_lines.append(f"⚠️ Couldn't find a pending task matching '{override['task']}'")
-                continue
-            sheets.reschedule_task(match["_row_number"], override["date"], _day_name(override["date"]))
-            calendar_sync.append_rescheduled_task(override["date"], match["Task"])
-            committed_lines.append(f"→ '{match['Task']}' moved to {override['date']} ({_day_name(override['date'])}) [your choice]")
+            # Apply explicit overrides first
+            for override in parsed["overrides"]:
+                match = sheets.find_task_by_name(override["task"])
+                if not match:
+                    committed_lines.append(f"⚠️ Couldn't find a pending task matching '{override['task']}'")
+                    continue
+                sheets.reschedule_task(match["_row_number"], override["date"], _day_name(override["date"]))
+                calendar_sync.append_rescheduled_task(override["date"], match["Task"])
+                committed_lines.append(f"→ '{match['Task']}' moved to {override['date']} ({_day_name(override['date'])}) [your choice]")
 
-        # Commit everything else at its original proposed date, if confirmed
-        if parsed["confirm_rest"]:
-            for row in pending:
-                if row["Task"].lower() in overridden_names:
-                    continue  # already handled above
-                target_date = _commit_proposal(row)
-                committed_lines.append(f"→ '{row['Task']}' moved to {target_date} ({_day_name(target_date)}) [confirmed]")
+            # Commit everything else at its original proposed date, if confirmed
+            if parsed["confirm_rest"]:
+                for row in pending:
+                    if row["Task"].lower() in overridden_names:
+                        continue  # already handled above
+                    target_date = _commit_proposal(row)
+                    committed_lines.append(f"→ '{row['Task']}' moved to {target_date} ({_day_name(target_date)}) [confirmed]")
 
-        whatsapp.send_message("✅ Updated:\n" + "\n".join(committed_lines) if committed_lines else "Nothing to update.")
-        return {"ok": True, "committed": committed_lines}
+            whatsapp.send_message("✅ Updated:\n" + "\n".join(committed_lines) if committed_lines else "Nothing to update.")
+            return {"ok": True, "committed": committed_lines}
 
-    # ---------- PHASE 1: normal 11PM check-in reply ----------
-    tasks = sheets.get_tasks_for_date(today)
-    if not tasks:
-        whatsapp.send_message("No tasks were scheduled today, nothing to update.")
-        return {"ok": True}
+        # ---------- PHASE 1: normal 11PM check-in reply ----------
+        tasks = sheets.get_tasks_for_date(today)
+        if not tasks:
+            whatsapp.send_message("No tasks were scheduled today, nothing to update.")
+            return {"ok": True}
 
-    statuses = reply_parser.parse_reply(tasks, reply_text)  # {1: "Done", 2: "In Progress", ...}
+        statuses = reply_parser.parse_reply(tasks, reply_text)  # {1: "Done", 2: "In Progress", ...}
 
-    done_names, proposal_lines = [], []
+        done_names, proposal_lines = [], []
 
-    for i, task in enumerate(tasks, start=1):
-        status = statuses.get(i, "Not Started")
-        row = task["_row_number"]
+        for i, task in enumerate(tasks, start=1):
+            status = statuses.get(i, "Not Started")
+            row = task["_row_number"]
 
-        if status == "Done":
-            sheets.update_status(row, "Done")
-            done_names.append(task["Task"])
-        else:
-            target_date = sheets.find_lightest_upcoming_day(today, window_days=7)
-            if target_date is None:
-                sheets.update_status(row, status)
-                proposal_lines.append(f"⚠️ Couldn't propose a slot for '{task['Task']}' — next 7 days are full")
-                continue
-            sheets.propose_reschedule(row, target_date)
-            proposal_lines.append(f"• '{task['Task']}' → proposed: {target_date} ({_day_name(target_date)})")
+            if status == "Done":
+                sheets.update_status(row, "Done")
+                done_names.append(task["Task"])
+            else:
+                target_date = sheets.find_lightest_upcoming_day(today, window_days=7)
+                if target_date is None:
+                    sheets.update_status(row, status)
+                    proposal_lines.append(f"⚠️ Couldn't propose a slot for '{task['Task']}' — next 7 days are full")
+                    continue
+                sheets.propose_reschedule(row, target_date)
+                proposal_lines.append(f"• '{task['Task']}' → proposed: {target_date} ({_day_name(target_date)})")
 
-    calendar_sync.sync_day_status(today, sheets.get_tasks_for_date(today))
+        calendar_sync.sync_day_status(today, sheets.get_tasks_for_date(today))
 
-    summary_lines = []
-    if done_names:
-        summary_lines.append("✅ Marked done:")
-        summary_lines += [f"  - {n}" for n in done_names]
-    if proposal_lines:
-        summary_lines.append("\n📅 Proposed reschedule (not moved yet):")
-        summary_lines += proposal_lines
-        summary_lines.append(
-            "\nReply 'ok' to confirm all, or 'move <task name> to <YYYY-MM-DD>' "
-            "to change specific ones — the rest will still confirm."
-        )
-    whatsapp.send_message("\n".join(summary_lines) if summary_lines else "Nothing to update.")
+        summary_lines = []
+        if done_names:
+            summary_lines.append("✅ Marked done:")
+            summary_lines += [f"  - {n}" for n in done_names]
+        if proposal_lines:
+            summary_lines.append("\n📅 Proposed reschedule (not moved yet):")
+            summary_lines += proposal_lines
+            summary_lines.append(
+                "\nReply 'ok' to confirm all, or 'move <task name> to <YYYY-MM-DD>' "
+                "to change specific ones — the rest will still confirm."
+            )
+        whatsapp.send_message("\n".join(summary_lines) if summary_lines else "Nothing to update.")
 
-    return {"ok": True, "done": done_names, "proposals": proposal_lines}
+        return {"ok": True, "done": done_names, "proposals": proposal_lines}
+
+    except Exception:
+        logger.exception("whatsapp_webhook failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": "webhook processing failed, check Render logs"})
 
 
 @app.get("/health")
