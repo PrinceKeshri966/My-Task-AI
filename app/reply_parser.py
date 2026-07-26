@@ -69,6 +69,10 @@ def parse_reply(tasks: list[dict], reply_text: str) -> dict[int, str]:
             for i in range(1, n + 1):
                 result[i] = blanket_status
 
+    # Smart number grouping: replace comma or 'and'/'aur' BETWEEN digits with space
+    # so that "1, 2, 3, 4 done" or "1 aur 2 done" stays together in one clause!
+    text = re.sub(r"(\d)\s*(?:,|\band\b|\baur\b)\s*(?=\d)", r"\1 ", text)
+
     # Split into clauses on common separators
     clauses = re.split(r",|;|\band\b|\baur\b", text)
 
