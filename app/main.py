@@ -77,9 +77,7 @@ def _commit_proposal(row: dict):
 
 
 @app.post("/webhook/whatsapp")
-async def whatsapp_webhook(request: Request, x_webhook_secret: str = Header(default="")):
-    if config.WEBHOOK_SHARED_SECRET and x_webhook_secret != config.WEBHOOK_SHARED_SECRET:
-        raise HTTPException(status_code=401, detail="bad secret")
+async def whatsapp_webhook(request: Request):
 
     try:
         form = await request.form()
